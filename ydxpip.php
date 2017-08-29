@@ -1,47 +1,70 @@
 <?php
 
 /**
- * Plugin Name: Yellow Dog XML Properties Import Plugin
- * Description: Fetch XML file from 'expert agent', parse XML and insert close matching fields into Wordpress custom posts - please note some filds do not match and cannot be imported
+ * Plugin Name: Yellow Dog Expert Agent Integration Plugin
+ * Description: Fetch data file via FTP from Expert Agent, parse XML, and insert close matching fields into Wordpress custom posts. Runs manually and on cron to keep sync. See settings page (Settings - > YDXPIP) for instructions and tools.
  * Author: John Rodwell
  * Author URI: 
- * Version: 1.0
+ * Version: 1.1
  * Plugin URI: 
  */
 
 /*
 
-Caveats:
+Notes:
 
-- This plugin was written in half a day
-- Branch must always be the first one for now - will there ever be other brances?
-- Property must be for sale - only one example is given with the 'Department' set as 'Residential Sales', and there is no indication of what the value would be for a rental property.
-- As above, many other fields do not match and cannot be filled, i.e. property has no description, title is not clear, property and lot size is not present, nor is year, location could be made from several fields but given location does not match exactly on Google maps, lat and long are blank making map useless (could possibly get from address via Google Maps API...), city is town and area is not included in the site but is in the XML - as are many others, pictures would have to be integrated with the gallery plugin and entered with a height, width, etc...
-- Since no ID is given (not one which matches an existing field anyway) a new property will always be added! (use title field to match? Must guarentee title will never be the same... or add new ID field from XML?)
-- Due to the above all new properties will be added as drafts via a settings page rather than a cron job.
-- Summary; square peg, round hole.
+- Branch must always be the first one for now - will there ever be other branches?
+
+- Fields do not line up exactly. For those fields which are not absolutely clear, editor should review...
+    - Description is Advert One in EA
+    - Title is Advert Heading - do not see this on EA - perhaps composite on their end?
+    - Location is a composite of fileds
+    - If lat/long are blank, an appriximate value is geolocated from the address
+    - Property and lot size are not present in EA, nor is year
+    - Post thumbnail is first gallery image by default
+
+- Cron runs hourly by default
+
+- Auto publish cannot be enabled in this version due to untested with real data
 
 */
 
-class ftp {
+// On activation set default cron frequency and auto publish
 
-    public $conn;
-
-    public function __construct($url) {
-        $this->conn = ftp_connect($url);
-    }
-    
-    public function __call($func, $a){
-        if(strstr($func, 'ftp_') !== false && function_exists($func)) {
-            array_unshift($a, $this->conn);
-            return call_user_func_array($func, $a);
-        } else {
-            die("$func is not a valid FTP function.");
-        }
+function ydxpip_activate() {
+    if(!wp_next_scheduled('ydxpip_cron')) {
+        wp_schedule_event(time(), 'hourly', 'ydxpip_cron');
     }
 }
 
-function runFTPUpdate() {
+register_activation_hook(__FILE__, 'ydxpip_activate');
+
+function ydxpip_deactivate() {
+    wp_clear_scheduled_hook('ydxpip_cron');
+}
+
+register_deactivation_hook(__FILE__, 'ydxpip_deactivate');
+
+// Prepare and use session to store saved post/objost data and report to admin screen
+
+function start_session() {
+    if(!session_id()) {
+        session_start();
+    }
+}
+
+add_action('init', 'start_session', 1);
+
+function end_session() {
+    session_destroy ();
+}
+
+add_action(‘wp_logout’, ‘end_session’);
+add_action(‘wp_login’, ‘end_session’);
+
+// Main script action - sync with EE
+
+function run_ftp_sync() {
 
     $ftp = new ftp('ftp.expertagent.co.uk');
     if(!$ftp->ftp_login('HavanaLuxuryVillas', '}CKPCM4Q6nTQ')) {
@@ -50,8 +73,6 @@ function runFTPUpdate() {
     if(!$ftp->ftp_pasv(TRUE)) {
     	die("Passive FTP mode failed.");
     }
-
-    //var_dump($ftp->ftp_nlist('/'));
 
     ob_start();
     $ftp->ftp_get('php://output', "/properties2.xml", FTP_BINARY);
@@ -77,40 +98,85 @@ function runFTPUpdate() {
 
     $properties = new SimpleXMLElement($xmlstr);
 
+    /* Get all property EE reference numbers */
+    $ee_refs = array();
+    $ref_query = new WP_Query('post_type=estate');
+    if($ref_query->have_posts()) : while($ref_query->have_posts()) :
+        $ref_query->the_post();
+        $ee_refs[] = array(
+            'id' => get_the_ID(),
+            'ref' => get_post_meta(get_the_ID(), 'ee_reference', true)
+        );
+    endwhile; endif;
+    wp_reset_postdata();
+
     foreach($properties->branches->branch[0]->properties as $properties) {
         foreach($properties->property as $property) {
 
-            echo "<p>Processing property...</p>";
+            /* Does property exist? */
+            $property_exists = false;
+            $property_reference = $property->property_reference->__toString();
+
+            foreach($ee_refs as $ee_ref) {
+                if($ee_ref['ref']==$property_reference) {
+                    $property_exists = true;
+                    $post_id = $ee_ref['id'];
+                    break;
+                }
+            }
 
             $title = $property->advert_heading;
             $property_type = $property->property_type;
-            $offer_type = 'sale'; //temp
+            $department = $property->department;
+            /* Department can be "Residential Sales" or "Residential Lettings" */
+            if($department=="Residential Sales") {
+                $offer_type = 'sale';
+            } else {
+                $offer_type = 'rent';
+            }
+            /* Description is 'Advert One/Main Advert' field */
+            $description = $property->main_advert;
             $city = $property->town;
             $featured = $property->featuredProperty;
             $price = $property->numeric_price;
+            /* Price normalised by removing decimal */
             $price = substr($price, 0, strpos($price, "."));
             $bedrooms = $property->bedrooms->__toString();
             $bathrooms = $property->bathrooms->__toString();
-            //$size = $property->estate_attr_property-size;
             $country = $property->country;
             $country = code_to_country($country);
             $district = $property->district->__toString();
+            $lat = $property->latitude->__toString();
+            $lng = $property->longitude->__toString();
+            /* Address is a composite of three fields */
+            $address = $city.", ".$district.", ".$country;
+            /* If lat/lng are not set, compute an approximate value */
+            if($lat=='0'&&$lng=='0') {
+                $_SESSION['ydxpip_notices']['errors'][] = "Lat/Lng is not set. Computing loaction from address '".$address."'...";
+                $geo = get_geoloation($address);
+                $loc = $geo[0]['geometry']['location'];
+                $lat = $loc['lat'];
+                $lng = $loc['lng'];
+            }
+            /* Location is serialised address, lat, lng */
             $location = array(
-                'adddress' => '$city.", ".$district.", ".$country;',
-                'lat' => $property->latitude->__toString(),
-                'lng' => $property->longitude->__toString()
+                'adddress' => $address,
+                'lat' => $lat,
+                'lng' => $lng
             );
 
-            $post_id = wp_insert_post(array (
-               'post_type' => 'estate',
-               'post_title' => $title,
-               'post_content' => '',
-               'post_status' => 'draft',
-               'comment_status' => 'open',
-               'ping_status' => 'open',
-            ));
+            if(!$property_exists) {
 
-            echo "<p>Inserted property $post_id</p>";
+                $post_id = wp_insert_post(array(
+                   'post_type' => 'estate',
+                   'post_title' => $title,
+                   'post_content' => $description,
+                   'post_status' => 'draft',
+                   'comment_status' => 'open',
+                   'ping_status' => 'open',
+                ));
+
+            }
 
             wp_set_object_terms($post_id, $property_type, 'property-type');
             wp_set_object_terms($post_id, $offer_type, 'offer-type');
@@ -131,14 +197,43 @@ function runFTPUpdate() {
             //update_post_meta($post_id, 'estate_attr_property-size', $size);
             update_post_meta($post_id, '_estate_location', 'myhome_estate_location');
             update_post_meta($post_id, 'estate_location', $location);
+            update_post_meta($post_id, 'ee_reference', $property_reference);
+
+            if(!$property_exists) {
+
+                $images = array();
+                update_post_meta($post_id, '_estate_gallery', 'myhome_estate_gallery');
+                foreach($property->pictures->picture as $picture) {
+                    $filename = $picture->filename;
+                    $image_id = upload_image($filename, $post_id);
+                    if(is_wp_error($image_id)) {
+                        $_SESSION['ydxpip_notices']['errors'][] = "Upload error: ".$image_id->get_error_message();
+                    } else {
+                        $images[] = $image_id;
+                    }
+                }
+                update_post_meta($post_id, 'estate_gallery', $images);
+                if(!empty($images)) {
+                    set_post_thumbnail($post_id, $images[0]);
+                }
+
+            }
+
+            if($property_exists) {
+                $_SESSION['ydxpip_notices']['notices'][] = "Updated property $post_id";
+            } else {
+                $_SESSION['ydxpip_notices']['notices'][] = "Inserted property $post_id";
+            }
 
         }
-
-        echo "<p>Done.</p>";
 
     }
 
 }
+
+// Add action for cron job
+
+add_action('ydxpip_cron', 'run_ftp_sync');
 
 // Add simple options page to run import
 
@@ -162,13 +257,18 @@ function ydxpip_options_func() {
 
     if(!empty($_POST)) {
         
-        // Fire update
+        if(isset($_POST['run'])) {
+            run_ftp_sync();
+        }
 
-        runFTPUpdate();
+        if(isset($_POST['frequency'])) {
+            wp_clear_scheduled_hook('ydxpip_cron');
+            wp_schedule_event(time(), $_POST['frequency'], 'ydxpip_cron');
+        }
 
     }
 
-    echo '<h4>Click here to grab the XML file and import it - please note some fields do not match and cannot be imported:</h4>';
+    echo '<h4>Click here to grab the XML file and synchronise it right now:</h4>';
 
     echo '<form method="post" action="">';
 
@@ -178,12 +278,83 @@ function ydxpip_options_func() {
 
     echo '</form>';
 
+    echo '<h4>Set cron frequency (the time between auto-runs of the synchronisation) here:</h4>';
+
+    echo '<form method="post" action="">';
+
+    $frequency = get_scheduled_event_frequency('ydxpip_cron');
+
+    echo '<select name="frequency">';
+    echo '<option value="hourly" ';
+    if($frequency=='hourly') echo 'selected';
+    echo '>Hourly</option>';
+    echo '<option value="twicedaily" ';
+    if($frequency=='twicedaily') echo 'selected';
+    echo '>Twice daily</option>';
+    echo '<option value="daily" ';
+    if($frequency=='daily') echo 'selected';
+    echo '>Daily</option>';
+    echo '</select>';
+
+    submit_button('Set');
+
+    echo '</form>';
+
+    echo "<h4>Notes:</h4>";
+
+    echo "<ul>";
+    echo "<li>Branch must always be the first one for now - will there ever be other branches?</li>";
+
+    echo "<li>Fields do not line up exactly. For those fields which are not absolutely clear, editor should review...</li>";
+        echo "<li><ul>";
+        echo "<li> - Description is Advert One in EA</li>";
+        echo "<li> - Title is Advert Heading - do not see this on EA - perhaps composite on their end?</li>";
+        echo "<li> - Location is a composite of fileds</li>";
+        echo "<li> - If lat/long are blank, an appriximate value is geolocated from the address</li>";
+        echo "<li> - Property and lot size are not present in EA, nor is year</li>";
+        echo "<li> - Post thumbnail is first gallery image by default</li>";
+    echo "</ul></li>";
+
+    echo "<li>Cron runs hourly by default</li>";
+
+    echo "<li>Auto publish cannot be enabled in this version due to untested with real data</li>";
+
+    echo "</ul>";
+
     echo '</div>';
 }
+
+// Add plugin to settings
 
 if (is_admin()) {
     add_action( 'admin_menu', 'ydxpip_plugin_menu' );
 }
+
+// Display admin notices
+
+function ydxpip_custom_admin_notices() {
+
+    if (array_key_exists('ydxpip_notices', $_SESSION)) {
+
+        foreach($_SESSION['ydxpip_notices']['errors'] as $error) {
+            ?><div class="error">
+                <p><?php echo $error; ?></p>
+            </div><?php
+        }
+
+        foreach($_SESSION['ydxpip_notices']['notices'] as $notice) {
+            ?><div class="updated">
+                <p><?php echo $notice; ?></p>
+            </div><?php
+        }
+
+        unset($_SESSION['ydxpip_notices']);
+
+    }
+
+}
+
+add_action( 'admin_notices', 'ydxpip_custom_admin_notices', 10, 3);
 
 // Utility functions
 
@@ -444,5 +615,69 @@ function code_to_country($code) {
     else return $countryList[$code];
 }
 
+function get_geoloation($address) {
+    $url = "http://maps.google.com/maps/api/geocode/json?sensor=false&address=" . urlencode($address);
+    $json = file_get_contents($url);
+    $data = json_decode($json, TRUE);
+    if($data['status']=="OK"){
+        return $data['results'];
+    }
+}
+
+function get_scheduled_event_frequency($hook) {
+    $schedule  = wp_get_schedule($hook);
+    return $schedule;
+    $schedules = wp_get_schedules();
+    return isset($schedules[$schedule]) ? $schedules[$schedule]['interval'] : false;
+}
+
+function upload_image($file, $post_id) {
+
+    // Set variables for storage, fix file filename for query strings
+    preg_match( '/[^\?]+\.(jpe?g|jpe|gif|png)\b/i', $file, $matches);
+    if (!$matches) {
+         return new WP_Error( 'image_sideload_failed', __('Invalid image URL'));
+    }
+
+    $file_array = array();
+    $file_array['name'] = basename($matches[0]);
+
+    // Download file to temp location
+    $file_array['tmp_name'] = download_url($file);
+
+    // If error storing temporarily, return the error
+    if(is_wp_error($file_array['tmp_name'])) {
+        return $file_array['tmp_name'];
+    }
+
+    // Do the validation and storage stuff
+    $id = media_handle_sideload($file_array, $post_id);
+
+    // If error storing permanently, unlink
+    if(is_wp_error($id)) {
+        @unlink($file_array['tmp_name']);
+    }
+
+    return $id;
+
+}
+
+class ftp {
+
+    public $conn;
+
+    public function __construct($url) {
+        $this->conn = ftp_connect($url);
+    }
+    
+    public function __call($func, $a){
+        if(strstr($func, 'ftp_') !== false && function_exists($func)) {
+            array_unshift($a, $this->conn);
+            return call_user_func_array($func, $a);
+        } else {
+            die("$func is not a valid FTP function.");
+        }
+    }
+}
 
 ?>
