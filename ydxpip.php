@@ -5,7 +5,7 @@
  * Description: Fetch data file via FTP from Expert Agent, parse XML, and insert close matching fields into Wordpress custom posts. Runs manually and on cron to keep sync. See settings page (Settings - > YDXPIP) for instructions and tools.
  * Author: John Rodwell
  * Author URI: 
- * Version: 1.1
+ * Version: 1.1.1
  * Plugin URI: 
  */
 
@@ -18,14 +18,20 @@ Notes:
 - Fields do not line up exactly. For those fields which are not absolutely clear, editor should review...
     - Description is Advert One in EA
     - Title is Advert Heading - do not see this on EA - perhaps composite on their end?
-    - Location is a composite of fileds
-    - If lat/long are blank, an appriximate value is geolocated from the address
+    - Location is a composite of fields
+    - If lat/long are blank, an approximate value is geolocated from the address
     - Property and lot size are not present in EA, nor is year
     - Post thumbnail is first gallery image by default
 
 - Cron runs hourly by default
 
 - Auto publish cannot be enabled in this version due to untested with real data
+
+- Still to do...
+    - Sync images properly
+    - Sync floor plans?
+    - Email re: new post inserted
+    - auto-publish feature
 
 */
 
@@ -67,38 +73,30 @@ add_action(‘wp_login’, ‘end_session’);
 function run_ftp_sync() {
 
     $ftp = new ftp('ftp.expertagent.co.uk');
-    if(!$ftp->ftp_login('HavanaLuxuryVillas', '}CKPCM4Q6nTQ')) {
-    	die("Login failed.");
-    }
-    if(!$ftp->ftp_pasv(TRUE)) {
-    	die("Passive FTP mode failed.");
-    }
+
+    $ret = $ftp->ftp_login('HavanaLuxuryVillas', '}CKPCM4Q6nTQ');
+    if(!handle_admin_error($ret, "FTP")) return false;
+
+    $ret = $ftp->ftp_pasv(TRUE);
+    if(!handle_admin_error($ret, "FTP")) return false;
 
     ob_start();
-    $ftp->ftp_get('php://output', "/properties2.xml", FTP_BINARY);
+    $ret = $ftp->ftp_get('php://output', "/properties2.xml", FTP_BINARY);
     $xmlstr = ob_get_contents();
     ob_end_clean();
 
-    /*
-    $local_file_path = "/Users/johnrodwell/Sites/havanallp/test/wp-content/uploads/properties2.xml";
-    if ($ftp->ftp_get($local_file_path, "/properties2.xml", FTP_BINARY)) {
-        echo "File successfully written.\n";
-    } else {
-        die("FTP get failed.");
-    }
-
-    $xmlstr = file_get_contents($local_file_path);
-    */
+    if(!handle_admin_error($ret, "FTP")) return false;
 
     if(!$xmlstr) {
-        die("FTP get failed");
+        $err = new WP_Error( 'ftp_failed', __('No XML retrieved.'));
+        if(!handle_admin_error($ret, "XML")) return false;
     }
 
     //echo $xmlstr;
 
     $properties = new SimpleXMLElement($xmlstr);
 
-    /* Get all property EE reference numbers */
+    /* Get all properties' EA reference numbers */
     $ee_refs = array();
     $ref_query = new WP_Query('post_type=estate');
     if($ref_query->have_posts()) : while($ref_query->have_posts()) :
@@ -253,24 +251,11 @@ function ydxpip_options_func() {
 
     echo '<h1>Yellow Dog XML Properties Import Plugin</h1>';
 
-    // Process form submit
-
-    if(!empty($_POST)) {
-        
-        if(isset($_POST['run'])) {
-            run_ftp_sync();
-        }
-
-        if(isset($_POST['frequency'])) {
-            wp_clear_scheduled_hook('ydxpip_cron');
-            wp_schedule_event(time(), $_POST['frequency'], 'ydxpip_cron');
-        }
-
-    }
-
     echo '<h4>Click here to grab the XML file and synchronise it right now:</h4>';
 
-    echo '<form method="post" action="">';
+    echo '<form method="post" action="'.esc_url(admin_url("admin-post.php")).'">';
+
+    echo '<input type="hidden" name="action" value="ftp_sync">';
 
     echo '<input type="hidden" name="run" value="1" />';
 
@@ -354,7 +339,31 @@ function ydxpip_custom_admin_notices() {
 
 }
 
-add_action( 'admin_notices', 'ydxpip_custom_admin_notices', 10, 3);
+// Process form submit
+
+function sync_form_submit() {
+    if(!empty($_POST)) {
+
+        if(isset($_POST['run'])) {
+            run_ftp_sync();  
+        }
+
+        if(isset($_POST['frequency'])) {
+            wp_clear_scheduled_hook('ydxpip_cron');
+            wp_schedule_event(time(), $_POST['frequency'], 'ydxpip_cron');
+        }
+
+        wp_redirect($_SERVER['HTTP_REFERER']);
+        exit();
+
+    }
+}
+
+// Actions for admin page
+
+add_action('admin_notices', 'ydxpip_custom_admin_notices', 10, 3);
+
+add_action('admin_post_ftp_sync', 'sync_form_submit');
 
 // Utility functions
 
@@ -673,10 +682,31 @@ class ftp {
     public function __call($func, $a){
         if(strstr($func, 'ftp_') !== false && function_exists($func)) {
             array_unshift($a, $this->conn);
-            return call_user_func_array($func, $a);
+            $ret = call_user_func_array($func, $a);
+            if(!$ret) {
+                if($func=='ftp_login') {
+                    return new WP_Error( 'ftp_failed', __('Connect failed. Most likely username/password is incorrect.'));
+                } else if($func=='ftp_passv') {
+                    return new WP_Error( 'ftp_failed', __('Passive mode failed. Most likely server does not support it.'));
+                } else if($func=='ftp_get') {
+                    return new WP_Error( 'ftp_failed', __('GET failed. Most likely file does not exist.'));
+                }
+            } else {
+                return true;
+            }
         } else {
-            die("$func is not a valid FTP function.");
+            return new WP_Error('ftp_failed', $func.__(' is not a valid FTP function.'));
         }
+    }
+}
+
+function handle_admin_error($err, $type) {
+    if(is_wp_error($err)) {
+        if(!$type) { $type = "General"; }
+        $_SESSION['ydxpip_notices']['errors'][] = $type." error: ".$err->get_error_message();
+        return false;
+    } else {
+        return true;
     }
 }
 
