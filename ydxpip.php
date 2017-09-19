@@ -5,7 +5,7 @@
  * Description: Fetch data file via FTP from Expert Agent, parse XML, and insert close matching fields into Wordpress custom posts. Runs manually and on cron to keep sync. See settings page (Settings - > YDXPIP) for instructions and tools.
  * Author: John Rodwell
  * Author URI: 
- * Version: 1.1.1
+ * Version: 1.2.1
  * Plugin URI: 
  */
 
@@ -16,26 +16,39 @@ Notes:
 - Branch must always be the first one for now - will there ever be other branches?
 
 - Fields do not line up exactly. For those fields which are not absolutely clear, editor should review...
-    - Description is Advert One in EA
-    - Title is Advert Heading - do not see this on EA - perhaps composite on their end?
+    - Description is 'Advert One' in EA - further adverts are not used
     - Location is a composite of fields
     - If lat/long are blank, an approximate value is geolocated from the address
-    - Property and lot size are not present in EA, nor is year
+    - Property and lot size are not present in EA, nor is year of build
+    - Concept of room description does not exist on WordPress frontend
     - Post thumbnail is first gallery image by default
 
 - Cron runs hourly by default
 
-- Auto publish cannot be enabled in this version due to untested with real data
-
 - Still to do...
-    - Sync images properly
-    - Sync floor plans?
-    - Email re: new post inserted
-    - auto-publish feature
+    - Check for existing images...
+    - Spinner
+    - auto-publish feature?
+    - performance issues uploading
+
+- Tests...
+    - Test image adding and deleting
+    - Test floorplan adding and deleting
+
+- Questions...
+    - Auto publish mode?
+    - Documentation/tutorial
 
 */
 
 // On activation set default cron frequency and auto publish
+
+// import image functions etc into cron job
+
+require_once(ABSPATH.  "wp-admin" . '/includes/image.php');
+require_once(ABSPATH . "wp-admin" . '/includes/file.php');
+require_once(ABSPATH . "wp-admin" . '/includes/media.php');
+require_once(ABSPATH . "wp-admin" . '/includes/admin.php');
 
 function ydxpip_activate() {
     if(!wp_next_scheduled('ydxpip_cron')) {
@@ -72,33 +85,38 @@ add_action(‘wp_login’, ‘end_session’);
 
 function run_ftp_sync() {
 
+    error_log("Running FTP sync...");
+
     $ftp = new ftp('ftp.expertagent.co.uk');
 
     $ret = $ftp->ftp_login('HavanaLuxuryVillas', '}CKPCM4Q6nTQ');
-    if(!handle_admin_error($ret, "FTP")) return false;
+    if(!handle_admin_error($ret, "FTP")) { error_log("FTP failed"); return false; }
 
     $ret = $ftp->ftp_pasv(TRUE);
-    if(!handle_admin_error($ret, "FTP")) return false;
+    if(!handle_admin_error($ret, "FTP")) { error_log("FTP failed"); return false; }
 
     ob_start();
     $ret = $ftp->ftp_get('php://output', "/properties2.xml", FTP_BINARY);
     $xmlstr = ob_get_contents();
     ob_end_clean();
 
-    if(!handle_admin_error($ret, "FTP")) return false;
+    if(!handle_admin_error($ret, "FTP")) { error_log("FTP failed"); return false; }
 
     if(!$xmlstr) {
         $err = new WP_Error( 'ftp_failed', __('No XML retrieved.'));
-        if(!handle_admin_error($ret, "XML")) return false;
+        if(!handle_admin_error($ret, "XML")) { error_log("FTP failed"); return false; }
     }
-
-    //echo $xmlstr;
 
     $properties = new SimpleXMLElement($xmlstr);
 
     /* Get all properties' EA reference numbers */
     $ee_refs = array();
-    $ref_query = new WP_Query('post_type=estate');
+    $args = array(
+        'post_type' => 'estate',
+        'post_status' => 'any',
+        'posts_per_page' => -1
+        );
+    $ref_query = new WP_Query($args);
     if($ref_query->have_posts()) : while($ref_query->have_posts()) :
         $ref_query->the_post();
         $ee_refs[] = array(
@@ -107,6 +125,15 @@ function run_ftp_sync() {
         );
     endwhile; endif;
     wp_reset_postdata();
+
+    ob_start();
+    var_dump($ee_refs);
+    $ee_refs_str = ob_get_contents();
+    ob_end_clean();
+
+    error_log("EE REFS = ".$ee_refs_str);
+
+    $properties_inserted = 0;
 
     foreach($properties->branches->branch[0]->properties as $properties) {
         foreach($properties->property as $property) {
@@ -119,6 +146,8 @@ function run_ftp_sync() {
                 if($ee_ref['ref']==$property_reference) {
                     $property_exists = true;
                     $post_id = $ee_ref['id'];
+                    $_SESSION['ydxpip_notices']['notices'][] = "Property $post_id exists.";
+                    error_log("Property $post_id exists.");
                     break;
                 }
             }
@@ -150,7 +179,8 @@ function run_ftp_sync() {
             $address = $city.", ".$district.", ".$country;
             /* If lat/lng are not set, compute an approximate value */
             if($lat=='0'&&$lng=='0') {
-                $_SESSION['ydxpip_notices']['errors'][] = "Lat/Lng is not set. Computing loaction from address '".$address."'...";
+                $_SESSION['ydxpip_notices']['notices'][] = "Lat/Lng is not set. Computing loaction from address '".$address."'...";
+                error_log("Lat/Lng is not set. Computing loaction from address '".$address."'...");
                 $geo = get_geoloation($address);
                 $loc = $geo[0]['geometry']['location'];
                 $lat = $loc['lat'];
@@ -164,6 +194,9 @@ function run_ftp_sync() {
             );
 
             if(!$property_exists) {
+
+                $_SESSION['ydxpip_notices']['notices'][] = "Doing post insert...";
+                error_log("Doing post insert...");
 
                 $post_id = wp_insert_post(array(
                    'post_type' => 'estate',
@@ -197,34 +230,120 @@ function run_ftp_sync() {
             update_post_meta($post_id, 'estate_location', $location);
             update_post_meta($post_id, 'ee_reference', $property_reference);
 
-            if(!$property_exists) {
+            // Strip to jpg name only before compare...
 
-                $images = array();
-                update_post_meta($post_id, '_estate_gallery', 'myhome_estate_gallery');
-                foreach($property->pictures->picture as $picture) {
-                    $filename = $picture->filename;
+            /* Images... */
+            update_post_meta($post_id, '_estate_gallery', 'myhome_estate_gallery');
+            $images = array();
+
+            $_SESSION['ydxpip_notices']['notices'][] = "Checking images...";
+            error_log("Checking images...");
+
+            foreach($property->pictures->picture as $picture) {
+                $filename = basename($picture->filename);
+                error_log("Uploading image $filename");
+                $image_id = upload_image($picture->filename, $post_id);
+                if(is_wp_error($image_id)) {
+                    $_SESSION['ydxpip_notices']['errors'][] = "Upload error: ".$image_id->get_error_message();
+                    error_log("Upload error: ".$image_id->get_error_message());
+                }
+                $images[] = $image_id;
+            }
+            update_post_meta($post_id, 'estate_gallery', $images);
+            if(!empty($images)) {
+                set_post_thumbnail($post_id, $images[0]);
+            }
+
+            /* Floor plans... */
+            update_post_meta($post_id, '_estate_plans', 'myhome_estate_plans');
+            $num_existing_plans = get_post_meta($post_id, 'estate_plans', true);
+            $num_plans = 0;
+            foreach($property->floorplans->floorplan as $floorplan) {
+                
+                $filename = $floorplan->filename;
+                if(!$image_id = attachment_url_to_postid($filename)) {
                     $image_id = upload_image($filename, $post_id);
                     if(is_wp_error($image_id)) {
                         $_SESSION['ydxpip_notices']['errors'][] = "Upload error: ".$image_id->get_error_message();
-                    } else {
-                        $images[] = $image_id;
+                        error_log("Upload error: ".$image_id->get_error_message());
                     }
                 }
-                update_post_meta($post_id, 'estate_gallery', $images);
-                if(!empty($images)) {
-                    set_post_thumbnail($post_id, $images[0]);
+                $plan_name = "Undefined";
+
+                $attributes = $floorplan->attributes();
+                foreach($attributes as $key=>$value) {
+                    if((string)$key=="name") $plan_name = $value->__toString();
                 }
 
+                $plan_name_key = "estate_plans_".$num_plans."_estate_plans_name";
+                $plan_image_key = "estate_plans_".$num_plans."_estate_plans_image";
+
+                update_post_meta($post_id, $plan_name_key, $plan_name);
+                update_post_meta($post_id, $plan_image_key, $image_id);
+                
+                $num_plans++;
+
             }
+            
+            if($num_existing_plans>$num_plans) {
+                for($i=$num_plans; $i<$num_existing_plans; $i++) {
+                    $plan_name_key = "estate_plans_".$i."_estate_plans_name";
+                    $plan_image_key = "estate_plans_".$i."_estate_plans_image";
+                    delete_post_meta($post_id, $plan_name_key);
+                    delete_post_meta($post_id, $plan_image_key);
+                }
+            }
+
+            update_post_meta($post_id, 'estate_plans', $num_plans);
+
+            /* Bullet points */
+
+            $bullet1 = $property->bullet1->__toString();
+            $bullet2 = $property->bullet2->__toString();
+            $bullet3 = $property->bullet3->__toString();
+            $bullet4 = $property->bullet4->__toString();
+            $bullet5 = $property->bullet5->__toString();
+            $bullet6 = $property->bullet6->__toString();
+            $bullet7 = $property->bullet7->__toString();
+            $bullet8 = $property->bullet8->__toString();
+            $bullet9 = $property->bullet9->__toString();
+            $bullet10 = $property->bullet10->__toString();
+
+            $tags = array($bullet1, $bullet2, $bullet3, $bullet4, $bullet5, $bullet6, $bullet7, $bullet8, $bullet9, $bullet10);
+            wp_set_post_terms($post_id, $tags, 'features');
+
+            /* Complete notices */
 
             if($property_exists) {
                 $_SESSION['ydxpip_notices']['notices'][] = "Updated property $post_id";
+                error_log("Updated property $post_id");
             } else {
                 $_SESSION['ydxpip_notices']['notices'][] = "Inserted property $post_id";
+                error_log("Inserted property $post_id");
+                $properties_inserted += 1;
             }
 
         }
 
+    }
+
+    /* Send email on post insert */
+
+    if($properties_inserted>0) {
+
+        $_SESSION['ydxpip_notices']['notices'][] = "Sending email";
+        error_log("Sending email"); 
+
+        $email_to = get_option('admin_email');
+        $email_subject = "New Properties added to HavannaLLP...";
+        $email_text = "For your information '.$properties_inserted.' new properties have been inserted into HavannaLLP as drafts ready for your approval and publishing.";
+         
+        $status = wp_mail($email_to, $email_subject, $email_text, $headers);
+        if(!$status) {
+            $_SESSION['ydxpip_notices']['notices'][] = "Email not sent";
+            error_log("Email not sent"); 
+        }
+        
     }
 
 }
@@ -321,16 +440,20 @@ function ydxpip_custom_admin_notices() {
 
     if (array_key_exists('ydxpip_notices', $_SESSION)) {
 
-        foreach($_SESSION['ydxpip_notices']['errors'] as $error) {
-            ?><div class="error">
-                <p><?php echo $error; ?></p>
-            </div><?php
+        if(!empty($_SESSION['ydxpip_notices']['errors'])) {
+            foreach($_SESSION['ydxpip_notices']['errors'] as $error) {
+                ?><div class="error">
+                    <p><?php echo $error; ?></p>
+                </div><?php
+            }
         }
 
-        foreach($_SESSION['ydxpip_notices']['notices'] as $notice) {
-            ?><div class="updated">
-                <p><?php echo $notice; ?></p>
-            </div><?php
+        if(!empty($_SESSION['ydxpip_notices']['notices'])) {
+            foreach($_SESSION['ydxpip_notices']['notices'] as $notice) {
+                ?><div class="updated">
+                    <p><?php echo $notice; ?></p>
+                </div><?php
+            }
         }
 
         unset($_SESSION['ydxpip_notices']);
@@ -709,5 +832,21 @@ function handle_admin_error($err, $type) {
         return true;
     }
 }
+
+function ydxpip_cron_schedules($schedules) {
+    if(!isset($schedules["10min"])) {
+        $schedules["10min"] = array(
+            'interval' => 10*60,
+            'display' => __('Once every 10 minutes'));
+    }
+    if(!isset($schedules["30min"])) {
+        $schedules["30min"] = array(
+            'interval' => 30*60,
+            'display' => __('Once every 30 minutes'));
+    }
+    return $schedules;
+}
+
+add_filter('cron_schedules', 'ydxpip_cron_schedules');
 
 ?>
