@@ -5,11 +5,15 @@
  * Description: Fetch data file via FTP from Expert Agent, parse XML, and insert close matching fields into Wordpress custom posts. Runs manually and on cron to keep sync. See settings page (Settings - > YDXPIP) for instructions and tools.
  * Author: John Rodwell
  * Author URI: 
- * Version: 1.2.1
+ * Version: 1.2.2
  * Plugin URI: 
  */
 
 /*
+
+Changelog:
+
+V1.2.2 deletes posts which are no longer present in the XML, and also uses different keys for the title.
 
 Notes:
 
@@ -26,18 +30,15 @@ Notes:
 - Cron runs hourly by default
 
 - Still to do...
-    - Check for existing images...
+    - Check for existing images?
     - Spinner
     - auto-publish feature?
     - performance issues uploading
+    - Refactor deleting
 
 - Tests...
     - Test image adding and deleting
     - Test floorplan adding and deleting
-
-- Questions...
-    - Auto publish mode?
-    - Documentation/tutorial
 
 */
 
@@ -107,14 +108,13 @@ function run_ftp_sync() {
         if(!handle_admin_error($ret, "XML")) { error_log("FTP failed"); return false; }
     }
 
-    $properties = new SimpleXMLElement($xmlstr);
-
     /* Get all properties' EA reference numbers */
     $ee_refs = array();
     $args = array(
         'post_type' => 'estate',
-        'post_status' => 'any',
-        'posts_per_page' => -1
+        'post_status' => array('publish', 'draft'),
+        'posts_per_page' => -1,
+        'meta_key' => 'ee_reference'
         );
     $ref_query = new WP_Query($args);
     if($ref_query->have_posts()) : while($ref_query->have_posts()) :
@@ -135,10 +135,51 @@ function run_ftp_sync() {
 
     $properties_inserted = 0;
 
+    /* Trash posts if no longer in the XML */
+
+    foreach($ee_refs as $ee_ref) {
+        $property_deleted = true;
+        $post_id = $ee_ref['id'];
+
+        //$_SESSION['ydxpip_notices']['notices'][] = "Post ID $post_id has EE reference ".$ee_ref['ref'];
+        //error_log("Post ID $post_id has EE reference ".$ee_ref['ref']);
+
+        $properties = new SimpleXMLElement($xmlstr);
+
+        foreach($properties->branches->branch[0]->properties as $properties) {
+            foreach($properties->property as $property) {
+
+                //$_SESSION['ydxpip_notices']['notices'][] = "In foreach...";
+                //error_log("In foreach...");
+
+                $property_reference = $property->property_reference->__toString();
+
+                //$_SESSION['ydxpip_notices']['notices'][] = "Checking EE reference $property_reference";
+                //error_log("Checking EE reference $property_reference");
+
+                if($ee_ref['ref']==$property_reference) {
+                    $property_deleted = false;
+
+                    //$_SESSION['ydxpip_notices']['notices'][] = "Checking EE reference $property_reference";
+                    //error_log("Checking EE reference $property_reference");
+
+                }
+            }     
+        }
+
+        if($property_deleted) {
+            wp_trash_post($post_id);
+            $_SESSION['ydxpip_notices']['notices'][] = "Deleted property $post_id as it no longer exists in the XML";
+            error_log("Deleted property $post_id as it no longer exists in the XML");
+        }
+    }
+
+    $properties = new SimpleXMLElement($xmlstr);
+
     foreach($properties->branches->branch[0]->properties as $properties) {
         foreach($properties->property as $property) {
 
-            /* Does property exist? */
+            /* Does property exist in the site? */
             $property_exists = false;
             $property_reference = $property->property_reference->__toString();
 
@@ -152,7 +193,12 @@ function run_ftp_sync() {
                 }
             }
 
-            $title = $property->advert_heading;
+            // Title is a combination of house name and road name
+            //$title = $property->advert_heading;          
+            $housenum = $property->house_number;
+            $roadname = $property->street;
+            $title = $housenum.", ".$roadname;
+
             $property_type = $property->property_type;
             $department = $property->department;
             /* Department can be "Residential Sales" or "Residential Lettings" */
@@ -326,7 +372,7 @@ function run_ftp_sync() {
         }
 
     }
-
+    
     /* Send email on post insert */
 
     if($properties_inserted>0) {
@@ -336,7 +382,7 @@ function run_ftp_sync() {
 
         $email_to = get_option('admin_email');
         $email_subject = "New Properties added to HavannaLLP...";
-        $email_text = "For your information '.$properties_inserted.' new properties have been inserted into HavannaLLP as drafts ready for your approval and publishing.";
+        $email_text = "For your information '.$properties_inserted.' new properties have been inserted into HavannaLLP as drafts ready for your approval and publishing";
          
         $status = wp_mail($email_to, $email_subject, $email_text, $headers);
         if(!$status) {
@@ -421,7 +467,7 @@ function ydxpip_options_func() {
 
     echo "<li>Cron runs hourly by default</li>";
 
-    echo "<li>Auto publish cannot be enabled in this version due to untested with real data</li>";
+    echo "<li>Auto publish cannot be enabled in this version</li>";
 
     echo "</ul>";
 
