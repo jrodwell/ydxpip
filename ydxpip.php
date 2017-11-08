@@ -297,7 +297,7 @@ function run_ftp_sync() {
             $updated_images_str = implode(",", $updated_images);
 
             if(!empty($images)) {
-                set_post_thumbnail($post_id, $images[0]);
+                set_post_thumbnail($post_id, $updated_images[0]);
             }
 
             update_post_meta($post_id, 'estate_gallery', $updated_images_str);
