@@ -219,6 +219,13 @@ function run_ftp_sync() {
                    'ping_status' => 'open',
                 ));
 
+            } else {
+                $changed_post = array(
+                    'ID'           => $post_id,
+                    'post_title'   => $title,
+                    'post_content' => $description
+                );
+                wp_update_post($changed_post);
             }
 
             wp_set_object_terms($post_id, $property_type, 'property-type');
@@ -253,19 +260,10 @@ function run_ftp_sync() {
             $existing_images_str = get_post_meta($post_id, 'estate_gallery', true);
             $existing_images_ids = explode(",", $existing_images_str);
 
-            /*
-            error_log("Logging existing images...");
-
-            ob_start();
-            var_dump($existing_images_ids);
-            $existing_images_ids_str = ob_get_contents();
-            ob_end_clean();
-
-            error_log($existing_images_ids_str);
-            */
-
-            $existing_filenames = array();
+            $existing_ids = array();
+            $existing_images = array();
             foreach($existing_images_ids as $existing_images_id) {
+                $existing_images[] = $existing_images_id;
                 $existing_filenames[] = get_post_meta($existing_images_id, 'orig_filename', true);
             }
 
@@ -296,12 +294,13 @@ function run_ftp_sync() {
             }
 
             $updated_images = array_unique(array_merge($existing_images, $images), SORT_REGULAR);
-            update_post_meta($post_id, 'estate_gallery', $updated_images);
+            $updated_images_str = implode(",", $updated_images);
+
             if(!empty($images)) {
                 set_post_thumbnail($post_id, $images[0]);
             }
 
-            update_post_meta($post_id, 'estate_gallery', implode(",", $images));
+            update_post_meta($post_id, 'estate_gallery', $updated_images_str);
 
             /* Floor plans (no redundancy check yet...) */
 
