@@ -5,7 +5,7 @@
  * Description: Fetch data file via FTP from Expert Agent, parse XML, and insert close matching fields into Wordpress custom posts. Runs manually and on cron to keep sync. See settings page (Settings - > YDXPIP) for instructions and tools.
  * Author: John Rodwell
  * Author URI: 
- * Version: 1.2.2
+ * Version: 1.2.3
  * Plugin URI: 
  */
 
@@ -13,7 +13,10 @@
 
 Changelog:
 
-V1.2.2 deletes posts which are no longer present in the XML, and also uses different keys for the title.
+V1.2.2  - deletes posts which are no longer present in the XML, and also uses different keys for the title.
+V1.2.3  - bugfixes - performance of deletion - refactored
+        - check existing images
+
 
 Notes:
 
@@ -30,11 +33,8 @@ Notes:
 - Cron runs hourly by default
 
 - Still to do...
-    - Check for existing images?
-    - Spinner
+    - Spinner?
     - auto-publish feature?
-    - performance issues uploading
-    - Refactor deleting
 
 - Tests...
     - Test image adding and deleting
@@ -82,9 +82,11 @@ function end_session() {
 add_action(‘wp_logout’, ‘end_session’);
 add_action(‘wp_login’, ‘end_session’);
 
-// Main script action - sync with EE
+/* Main script action - sync with EE */
 
 function run_ftp_sync() {
+
+    /* get XML string */
 
     error_log("Running FTP sync...");
 
@@ -108,7 +110,10 @@ function run_ftp_sync() {
         if(!handle_admin_error($ret, "XML")) { error_log("FTP failed"); return false; }
     }
 
+    $properties = new SimpleXMLElement($xmlstr);
+
     /* Get all properties' EA reference numbers */
+
     $ee_refs = array();
     $args = array(
         'post_type' => 'estate',
@@ -135,51 +140,12 @@ function run_ftp_sync() {
 
     $properties_inserted = 0;
 
-    /* Trash posts if no longer in the XML */
-
-    foreach($ee_refs as $ee_ref) {
-        $property_deleted = true;
-        $post_id = $ee_ref['id'];
-
-        //$_SESSION['ydxpip_notices']['notices'][] = "Post ID $post_id has EE reference ".$ee_ref['ref'];
-        //error_log("Post ID $post_id has EE reference ".$ee_ref['ref']);
-
-        $properties = new SimpleXMLElement($xmlstr);
-
-        foreach($properties->branches->branch[0]->properties as $properties) {
-            foreach($properties->property as $property) {
-
-                //$_SESSION['ydxpip_notices']['notices'][] = "In foreach...";
-                //error_log("In foreach...");
-
-                $property_reference = $property->property_reference->__toString();
-
-                //$_SESSION['ydxpip_notices']['notices'][] = "Checking EE reference $property_reference";
-                //error_log("Checking EE reference $property_reference");
-
-                if($ee_ref['ref']==$property_reference) {
-                    $property_deleted = false;
-
-                    //$_SESSION['ydxpip_notices']['notices'][] = "Checking EE reference $property_reference";
-                    //error_log("Checking EE reference $property_reference");
-
-                }
-            }     
-        }
-
-        if($property_deleted) {
-            wp_trash_post($post_id);
-            $_SESSION['ydxpip_notices']['notices'][] = "Deleted property $post_id as it no longer exists in the XML";
-            error_log("Deleted property $post_id as it no longer exists in the XML");
-        }
-    }
-
-    $properties = new SimpleXMLElement($xmlstr);
+    $XML_properties = array();
 
     foreach($properties->branches->branch[0]->properties as $properties) {
         foreach($properties->property as $property) {
 
-            /* Does property exist in the site? */
+            /* Does property exist in the XML AND the site? */
             $property_exists = false;
             $property_reference = $property->property_reference->__toString();
 
@@ -225,8 +191,8 @@ function run_ftp_sync() {
             $address = $city.", ".$district.", ".$country;
             /* If lat/lng are not set, compute an approximate value */
             if($lat=='0'&&$lng=='0') {
-                $_SESSION['ydxpip_notices']['notices'][] = "Lat/Lng is not set. Computing loaction from address '".$address."'...";
-                error_log("Lat/Lng is not set. Computing loaction from address '".$address."'...");
+                //$_SESSION['ydxpip_notices']['notices'][] = "Lat/Lng is not set. Computing loaction from address '".$address."'...";
+                //error_log("Lat/Lng is not set. Computing loaction from address '".$address."'...");
                 $geo = get_geoloation($address);
                 $loc = $geo[0]['geometry']['location'];
                 $lat = $loc['lat'];
@@ -276,43 +242,79 @@ function run_ftp_sync() {
             update_post_meta($post_id, 'estate_location', $location);
             update_post_meta($post_id, 'ee_reference', $property_reference);
 
-            // Strip to jpg name only before compare...
+            /* Images */
 
-            /* Images... */
             update_post_meta($post_id, '_estate_gallery', 'myhome_estate_gallery');
             $images = array();
 
             $_SESSION['ydxpip_notices']['notices'][] = "Checking images...";
             error_log("Checking images...");
+            
+            $existing_images_str = get_post_meta($post_id, 'estate_gallery', true);
+            $existing_images_ids = explode(",", $existing_images_str);
 
-            foreach($property->pictures->picture as $picture) {
-                $filename = basename($picture->filename);
-                error_log("Uploading image $filename");
-                $image_id = upload_image($picture->filename, $post_id);
-                if(is_wp_error($image_id)) {
-                    $_SESSION['ydxpip_notices']['errors'][] = "Upload error: ".$image_id->get_error_message();
-                    error_log("Upload error: ".$image_id->get_error_message());
-                }
-                $images[] = $image_id;
+            /*
+            error_log("Logging existing images...");
+
+            ob_start();
+            var_dump($existing_images_ids);
+            $existing_images_ids_str = ob_get_contents();
+            ob_end_clean();
+
+            error_log($existing_images_ids_str);
+            */
+
+            $existing_filenames = array();
+            foreach($existing_images_ids as $existing_images_id) {
+                $existing_filenames[] = get_post_meta($existing_images_id, 'orig_filename', true);
             }
-            update_post_meta($post_id, 'estate_gallery', $images);
+
+            //$_SESSION['ydxpip_notices']['notices'][] = "Existing filenames = ".implode(", ", $existing_filenames);
+            //error_log("Existing filenames = ".implode(", ", $existing_filenames));
+            
+            foreach($property->pictures->picture as $picture) {
+
+                /* Try to check if image exists... */
+
+                $filename = basename($picture->filename);
+                if(!in_array($filename, $existing_filenames)) {
+                    //$_SESSION['ydxpip_notices']['notices'][] = "Uploading image $filename";
+                    //error_log("Uploading image $filename");
+                    $image_id = upload_image($picture->filename, $post_id);
+                    update_post_meta($image_id, 'orig_filename', $filename);
+                    if(is_wp_error($image_id)) {
+                        $_SESSION['ydxpip_notices']['errors'][] = "Upload error: ".$image_id->get_error_message();
+                        error_log("Upload error: ".$image_id->get_error_message());
+                        break;
+                    }
+                    $images[] = $image_id;
+                    update_post_meta($image_id, 'orig_filename', $filename);
+                } else {
+                    //$_SESSION['ydxpip_notices']['notices'][] = "Not uploading image $filename as it already exists";
+                    //error_log("Not uploading image $filename as it already exists");
+                }
+            }
+
+            $updated_images = array_unique(array_merge($existing_images, $images), SORT_REGULAR);
+            update_post_meta($post_id, 'estate_gallery', $updated_images);
             if(!empty($images)) {
                 set_post_thumbnail($post_id, $images[0]);
             }
 
-            /* Floor plans... */
+            update_post_meta($post_id, 'estate_gallery', implode(",", $images));
+
+            /* Floor plans (no redundancy check yet...) */
+
             update_post_meta($post_id, '_estate_plans', 'myhome_estate_plans');
             $num_existing_plans = get_post_meta($post_id, 'estate_plans', true);
             $num_plans = 0;
             foreach($property->floorplans->floorplan as $floorplan) {
                 
                 $filename = $floorplan->filename;
-                if(!$image_id = attachment_url_to_postid($filename)) {
-                    $image_id = upload_image($filename, $post_id);
-                    if(is_wp_error($image_id)) {
-                        $_SESSION['ydxpip_notices']['errors'][] = "Upload error: ".$image_id->get_error_message();
-                        error_log("Upload error: ".$image_id->get_error_message());
-                    }
+                $image_id = upload_image($filename, $post_id);
+                if(is_wp_error($image_id)) {
+                    $_SESSION['ydxpip_notices']['errors'][] = "Upload error: ".$image_id->get_error_message();
+                    error_log("Upload error: ".$image_id->get_error_message());
                 }
                 $plan_name = "Undefined";
 
@@ -369,10 +371,27 @@ function run_ftp_sync() {
                 $properties_inserted += 1;
             }
 
+            $XML_properties[] = $post_id;
+
         }
 
     }
-    
+
+    $_SESSION['ydxpip_notices']['notices'][] = "Trashing redundant properties...";
+    error_log("Trashing properties...");
+    //$_SESSION['ydxpip_notices']['notices'][] = "XML properties = ".implode(", ", $XML_properties);
+    //error_log("XML properties = ".implode(", ", $XML_properties));
+
+    /* Trash properties no longer in the XML */
+
+    foreach($ee_refs as $ee_ref) {
+       if(!in_array($ee_ref['id'], $XML_properties)) {
+            wp_trash_post($ee_ref['id']);
+            $_SESSION['ydxpip_notices']['notices'][] = "Deleted property $post_id as it no longer exists in the XML";
+            error_log("Deleted property $post_id as it no longer exists in the XML");
+       }      
+    }
+
     /* Send email on post insert */
 
     if($properties_inserted>0) {
@@ -391,6 +410,9 @@ function run_ftp_sync() {
         }
         
     }
+
+    $_SESSION['ydxpip_notices']['notices'][] = "Done.";
+    error_log("Done.");
 
 }
 
@@ -458,7 +480,7 @@ function ydxpip_options_func() {
     echo "<li>Fields do not line up exactly. For those fields which are not absolutely clear, editor should review...</li>";
         echo "<li><ul>";
         echo "<li> - Description is Advert One in EA</li>";
-        echo "<li> - Title is Advert Heading - do not see this on EA - perhaps composite on their end?</li>";
+        echo "<li> - Title is a combination of house name/num and road name</li>";
         echo "<li> - Location is a composite of fileds</li>";
         echo "<li> - If lat/long are blank, an appriximate value is geolocated from the address</li>";
         echo "<li> - Property and lot size are not present in EA, nor is year</li>";
